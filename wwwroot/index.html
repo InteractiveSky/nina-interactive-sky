@@ -1,0 +1,501 @@
+﻿<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,height=device-height,initial-scale=1.0,user-scalable=no" />
+  <title>Interactive Sky</title>
+  <style>
+    html, body { margin:0; padding:0; height:100%; background:#0b0b12; overflow:hidden; font-family: Segoe UI, Arial, sans-serif; }
+    #app { position:relative; width:100%; height:100%; }
+    #aladin { position:absolute; inset:0; }
+
+    /* prevent touch rotate gestures from tilting the view */
+    #aladin, #aladin canvas {
+      touch-action: pan-x pan-y;
+      -ms-touch-action: pan-x pan-y;
+    }
+
+    /* HUD */
+    #hud {
+      position:absolute; left:16px; top:12px; right:16px;
+      display:flex; gap:12px; align-items:center; pointer-events:none;
+      color:#eaeaf2; text-shadow:0 1px 2px rgba(0,0,0,.6);
+      z-index:20;
+    }
+    #title { font-size:18px; font-weight:700; }
+    #statusWrap { margin-left:auto; display:flex; align-items:center; gap:10px; }
+    #status { font-size:12px; opacity:.95; white-space:pre; text-align:right; }
+
+    .bar { width:180px; height:8px; border-radius:999px; background:rgba(255,255,255,.12); overflow:hidden; }
+    .bar > i { display:block; height:100%; width:45%; background:rgba(255,255,255,.5); border-radius:999px; animation: slide 1.1s linear infinite; }
+    @keyframes slide { 0% { transform: translateX(-120%); } 100% { transform: translateX(280%); } }
+
+    /* Error panel */
+    #error {
+      position:absolute; left:16px; right:16px; bottom:16px;
+      padding:12px 14px; border-radius:10px;
+      background:rgba(180,30,30,.22);
+      border:1px solid rgba(255,90,90,.35);
+      color:#ffecec; font-size:12px; line-height:1.35;
+      display:none; z-index:30;
+      white-space:pre-wrap;
+      pointer-events:auto;
+    }
+
+    /* Overlay layer */
+    #fovOverlay{
+      position:absolute; inset:0;
+      pointer-events:none;
+      z-index:15;
+    }
+
+    /* Target FOV (centered) */
+    #fovRect{
+      position:absolute;
+      left:50%; top:50%;
+      transform:translate(-50%,-50%) rotate(0deg);
+      transform-origin:center;
+      border:2px solid rgba(255,220,120,.95);
+      border-radius:12px;
+      box-shadow:0 0 18px rgba(255,220,120,.35);
+      width:320px;
+      height:220px;
+      box-sizing:border-box;
+    }
+
+    /* Mount marker FOV (moves with mount position) */
+    #mountRect{
+      position:absolute;
+      transform:translate(-50%,-50%) rotate(0deg);
+      transform-origin:center;
+      border:2px solid rgba(120,220,255,.95);
+      border-radius:12px;
+      box-shadow:0 0 18px rgba(120,220,255,.30);
+      width:320px;
+      height:220px;
+      box-sizing:border-box;
+      display:none;
+    }
+
+    #centerCross{
+      position:absolute;
+      left:50%; top:50%;
+      width:18px; height:18px;
+      transform:translate(-50%,-50%);
+      border:1px solid rgba(255,255,255,.55);
+      border-radius:2px;
+      box-shadow:0 0 0 3px rgba(0,0,0,.25);
+    }
+
+    /* ===== Button (clickable above Aladin) ===== */
+    #controls {
+      position:absolute;
+      right:16px;
+      bottom:16px;
+      z-index:9999;
+      pointer-events:auto;
+      display:flex;
+      flex-direction:column;
+      gap:10px;
+    }
+    .btn {
+      border:1px solid rgba(255,255,255,.18);
+      background:rgba(20,20,32,.72);
+      color:#f2f2ff;
+      padding:10px 12px;
+      border-radius:12px;
+      font-size:13px;
+      font-weight:700;
+      cursor:pointer;
+      user-select:none;
+      box-shadow:0 8px 24px rgba(0,0,0,.35);
+      backdrop-filter: blur(8px);
+      -webkit-backdrop-filter: blur(8px);
+      text-align:center;
+      min-width:210px;
+    }
+    .btnPrimary {
+      border-color: rgba(255,220,120,.40);
+      background: rgba(90,70,20,.72);
+    }
+    .btn:active { transform: translateY(1px); }
+
+
+    #title { display:none !important; }
+  </style>
+</head>
+
+<body>
+<div id="app">
+  <div id="aladin"></div>
+
+  <div id="fovOverlay">
+    <div id="mountRect"></div>
+    <div id="fovRect"></div>
+    <div id="centerCross"></div>
+  </div>
+
+  <div id="hud">
+    <div id="title">Interactive Sky</div>
+    <div id="statusWrap">
+      <div id="status">Loading sky engine…</div>
+      <div class="bar" aria-hidden="true"><i></i></div>
+    </div>
+  </div>
+
+  <div id="controls">
+    <div id="btnSyncSlew" class="btn btnPrimary">Sync Scope to FOV (Slew)</div>
+  </div>
+
+  <div id="error"></div>
+</div>
+
+<script>
+  // ======= Defaults until NINA sends real values =======
+  let SENSOR_WIDTH_MM  = 22.3;
+  let SENSOR_HEIGHT_MM = 14.9;
+  let FOCAL_LENGTH_MM  = 800.0;
+  let ROTATION_DEG     = 0.0;
+
+  let MOUNT_CONNECTED = false;
+  let MOUNT_RA_HOURS  = 0.0;
+  let MOUNT_DEC_DEG   = 0.0;
+
+  let TARGET_RA_HOURS = 0.0;
+  let TARGET_DEC_DEG  = 0.0;
+  // =====================================================
+
+  const LOCK_ALADIN_ROTATION = true;
+
+  const statusEl = document.getElementById("status");
+  const errorEl  = document.getElementById("error");
+  const aladinEl = document.getElementById("aladin");
+  const fovRect  = document.getElementById("fovRect");
+  const mountRect= document.getElementById("mountRect");
+  const btnSyncSlew = document.getElementById("btnSyncSlew");
+
+  let aladinInstance = null;
+  let cameraFov = null;
+
+  function setStatus(text){ statusEl.textContent = text; }
+  function showError(msg){
+    errorEl.style.display = "block";
+    errorEl.textContent = msg;
+  }
+  function clearError(){
+    errorEl.style.display = "none";
+    errorEl.textContent = "";
+  }
+
+  function postToHost(payload){
+    try{
+      if (window.chrome && window.chrome.webview) {
+        window.chrome.webview.postMessage(payload);
+      }
+    } catch {}
+  }
+
+  function computeCameraFovDeg(){
+    const rad2deg = 180 / Math.PI;
+    const fovW = 2 * Math.atan(SENSOR_WIDTH_MM  / (2 * FOCAL_LENGTH_MM)) * rad2deg;
+    const fovH = 2 * Math.atan(SENSOR_HEIGHT_MM / (2 * FOCAL_LENGTH_MM)) * rad2deg;
+    return { fovW, fovH };
+  }
+
+  function extractViewFovDeg(aladin){
+    if (!aladin || !aladin.getFov) return null;
+    try {
+      const f = aladin.getFov();
+      if (Array.isArray(f) && typeof f[0] === "number" && isFinite(f[0])) return f[0];
+      if (typeof f === "number" && isFinite(f)) return f;
+      if (f && typeof f === "object") {
+        for (const k of Object.keys(f)) {
+          if (typeof f[k] === "number" && isFinite(f[k])) return f[k];
+        }
+      }
+    } catch {}
+    return null;
+  }
+
+  function setOverlayRotationDeg(deg){
+    const angle = (typeof deg === "number" && isFinite(deg)) ? deg : 0;
+    fovRect.style.transform   = `translate(-50%,-50%) rotate(${angle}deg)`;
+    mountRect.style.transform = `translate(-50%,-50%) rotate(${angle}deg)`;
+  }
+
+  function enforceAladinRotationLock(){
+    if (!LOCK_ALADIN_ROTATION || !aladinInstance) return;
+    try {
+      if (typeof aladinInstance.setRotateEnabled === "function") aladinInstance.setRotateEnabled(false);
+      if (typeof aladinInstance.setRotation === "function") aladinInstance.setRotation(0);
+      if (typeof aladinInstance.setOption === "function") {
+        aladinInstance.setOption("rotate", false);
+        aladinInstance.setOption("rotation", 0);
+      }
+    } catch {}
+  }
+
+  function updateFovOverlay(aladin){
+    if (!cameraFov) cameraFov = computeCameraFovDeg();
+
+    const viewFovDeg = extractViewFovDeg(aladin);
+    const w = aladinEl.clientWidth;
+    const h = aladinEl.clientHeight;
+
+    if (!viewFovDeg || !(w>0 && h>0)) {
+      setStatus(
+        "Waiting for view FOV…\n" +
+        `camera: ${cameraFov.fovW.toFixed(2)}° x ${cameraFov.fovH.toFixed(2)}°\n` +
+        "viewFov: (unknown)"
+      );
+      return;
+    }
+
+    const rectWpx = (cameraFov.fovW / viewFovDeg) * w;
+    const rectHpx = (cameraFov.fovH * w) / viewFovDeg;
+
+    const minPx = 12;
+    const rw = Math.max(minPx, rectWpx);
+    const rh = Math.max(minPx, rectHpx);
+
+    fovRect.style.width  = rw + "px";
+    fovRect.style.height = rh + "px";
+
+    mountRect.style.width  = rw + "px";
+    mountRect.style.height = rh + "px";
+
+    setStatus(
+      `Ready ✅ (${LOCK_ALADIN_ROTATION ? "north up" : "rotation free"})\n` +
+      `sensor: ${SENSOR_WIDTH_MM.toFixed(2)}×${SENSOR_HEIGHT_MM.toFixed(2)} mm  focal: ${FOCAL_LENGTH_MM.toFixed(1)} mm\n` +
+      `camera: ${cameraFov.fovW.toFixed(2)}° x ${cameraFov.fovH.toFixed(2)}°  viewFov: ${viewFovDeg.toFixed(3)}°\n` +
+      `mount: ${MOUNT_CONNECTED ? "ON" : "OFF"}  RA ${MOUNT_RA_HOURS.toFixed(3)}h  Dec ${MOUNT_DEC_DEG.toFixed(2)}°\n` +
+      `target: RA ${TARGET_RA_HOURS.toFixed(3)}h  Dec ${TARGET_DEC_DEG.toFixed(2)}°`
+    );
+  }
+
+  function worldToPix(raDeg, decDeg){
+    if (!aladinInstance) return null;
+    try {
+      if (typeof aladinInstance.world2pix === "function") return aladinInstance.world2pix(raDeg, decDeg);
+      if (aladinInstance.view && typeof aladinInstance.view.world2pix === "function") return aladinInstance.view.world2pix(raDeg, decDeg);
+    } catch {}
+    return null;
+  }
+
+  function updateMountMarker(){
+    if (!aladinInstance) return;
+
+    if (!MOUNT_CONNECTED) {
+      mountRect.style.display = "none";
+      return;
+    }
+
+    const raDeg = MOUNT_RA_HOURS * 15.0;
+    const decDeg = MOUNT_DEC_DEG;
+
+    const pt = worldToPix(raDeg, decDeg);
+    if (!pt || !isFinite(pt[0]) || !isFinite(pt[1])) {
+      mountRect.style.display = "none";
+      return;
+    }
+
+    mountRect.style.display = "block";
+    mountRect.style.left = pt[0] + "px";
+    mountRect.style.top  = pt[1] + "px";
+  }
+
+  // Read center via pix2world at screen center
+  function getCenterRaDecDeg(){
+    if (!aladinInstance) return null;
+    try {
+      const w = aladinEl.clientWidth;
+      const h = aladinEl.clientHeight;
+      const cx = w * 0.5;
+      const cy = h * 0.5;
+
+      if (typeof aladinInstance.pix2world === "function") {
+        const r = aladinInstance.pix2world(cx, cy);
+        if (Array.isArray(r) && isFinite(r[0]) && isFinite(r[1])) return { raDeg: r[0], decDeg: r[1] };
+      }
+      if (aladinInstance.view && typeof aladinInstance.view.pix2world === "function") {
+        const r = aladinInstance.view.pix2world(cx, cy);
+        if (Array.isArray(r) && isFinite(r[0]) && isFinite(r[1])) return { raDeg: r[0], decDeg: r[1] };
+      }
+    } catch {}
+    return null;
+  }
+
+  // Button: set target to center + slew
+  btnSyncSlew.addEventListener("click", () => {
+    clearError();
+
+    if (!aladinInstance) { showError("Aladin not ready yet."); return; }
+
+    const c = getCenterRaDecDeg();
+    if (!c) { showError("Could not read center coordinates yet."); return; }
+
+    const raHours = c.raDeg / 15.0;
+
+    TARGET_RA_HOURS = raHours;
+    TARGET_DEC_DEG  = c.decDeg;
+
+    const msgSet  = { type: "setTarget", raHours: raHours, decDeg: c.decDeg };
+    const msgSlew = { type: "slewToTarget" };
+
+    // send as object
+    postToHost(msgSet);
+    postToHost(msgSlew);
+
+    // ALSO send as string (some WebView2 builds deliver root as JSON string)
+    try { window.chrome?.webview?.postMessage(JSON.stringify(msgSet)); } catch {}
+    try { window.chrome?.webview?.postMessage(JSON.stringify(msgSlew)); } catch {}
+
+    const old = btnSyncSlew.textContent;
+    btnSyncSlew.textContent = "Slewing…";
+    setTimeout(() => btnSyncSlew.textContent = old, 1200);
+  });
+
+  // Prevent browser zoom gestures
+  aladinEl.addEventListener("wheel", (e) => {
+    if (e.ctrlKey) e.preventDefault();
+  }, { passive:false });
+
+  ["gesturestart","gesturechange","gestureend"].forEach(evt => {
+    aladinEl.addEventListener(evt, (e) => e.preventDefault(), { passive:false });
+  });
+
+  // Receive state from NINA host
+  if (window.chrome?.webview) {
+    window.chrome.webview.addEventListener("message", (ev) => {
+      const msg = ev.data;
+      if (!msg || typeof msg !== "object") return;
+
+      if (msg.type === "skyState") {
+        if (typeof msg.sensorWidth_mm === "number")  SENSOR_WIDTH_MM = msg.sensorWidth_mm;
+        if (typeof msg.sensorHeight_mm === "number") SENSOR_HEIGHT_MM = msg.sensorHeight_mm;
+        if (typeof msg.focalLength_mm === "number")  FOCAL_LENGTH_MM = msg.focalLength_mm;
+        if (typeof msg.rotationDeg === "number")     ROTATION_DEG = msg.rotationDeg;
+
+        if (typeof msg.mountConnected === "boolean") MOUNT_CONNECTED = msg.mountConnected;
+        if (typeof msg.mountRaHours === "number")    MOUNT_RA_HOURS = msg.mountRaHours;
+        if (typeof msg.mountDecDeg === "number")     MOUNT_DEC_DEG = msg.mountDecDeg;
+
+        if (typeof msg.targetRaHours === "number")   TARGET_RA_HOURS = msg.targetRaHours;
+        if (typeof msg.targetDecDeg === "number")    TARGET_DEC_DEG = msg.targetDecDeg;
+
+        cameraFov = computeCameraFovDeg();
+        setOverlayRotationDeg(ROTATION_DEG);
+
+        if (aladinInstance) {
+          enforceAladinRotationLock();
+          updateFovOverlay(aladinInstance);
+          updateMountMarker();
+        }
+      }
+    });
+  }
+
+  // Load Aladin Lite v3
+  const ALADIN_JS = "https://aladin.cds.unistra.fr/AladinLite/api/v3/latest/aladin.js";
+
+  setStatus("Loading Aladin Lite…");
+  const s = document.createElement("script");
+  s.src = ALADIN_JS;
+  s.async = true;
+
+  s.onload = () => {
+    setStatus("Initializing viewer…");
+    try {
+      A.init.then(() => {
+        setStatus("Rendering sky…");
+
+        aladinInstance = A.aladin("#aladin", {
+          survey: "P/DSS2/color",
+          fov: 5.0,
+          target: "M31",
+          cooFrame: "equatorial",
+          showCooGrid: true,
+          showReticle: false,
+          showFrame: false
+        });
+
+        enforceAladinRotationLock();
+
+        // Tell host we are ready
+        postToHost({ type: "ready" });
+        try { window.chrome?.webview?.postMessage(JSON.stringify({ type:"ready" })); } catch {}
+
+        setOverlayRotationDeg(ROTATION_DEG);
+        cameraFov = computeCameraFovDeg();
+        updateFovOverlay(aladinInstance);
+        updateMountMarker();
+
+        // Click on sky -> set target
+        function pix2world(x, y){
+          try{
+            if (typeof aladinInstance.pix2world === "function") return aladinInstance.pix2world(x, y);
+            if (aladinInstance.view && typeof aladinInstance.view.pix2world === "function") return aladinInstance.view.pix2world(x, y);
+          }catch{}
+          return null;
+        }
+
+        aladinEl.addEventListener("click", (ev) => {
+          if (!aladinInstance) return;
+          const rect = aladinEl.getBoundingClientRect();
+          const x = ev.clientX - rect.left;
+          const y = ev.clientY - rect.top;
+
+          const w = pix2world(x, y);
+          if (!w || !isFinite(w[0]) || !isFinite(w[1])) return;
+
+          const raDeg = w[0];
+          const decDeg = w[1];
+          const raHours = raDeg / 15.0;
+
+          const msg = { type: "setTarget", raHours: raHours, decDeg: decDeg };
+          postToHost(msg);
+          try { window.chrome?.webview?.postMessage(JSON.stringify(msg)); } catch {}
+        });
+
+        if (aladinInstance.on) {
+          aladinInstance.on("zoomChanged", () => {
+            enforceAladinRotationLock();
+            updateFovOverlay(aladinInstance);
+            updateMountMarker();
+          });
+          aladinInstance.on("positionChanged", () => {
+            enforceAladinRotationLock();
+            updateMountMarker();
+          });
+        }
+
+        setInterval(() => {
+          enforceAladinRotationLock();
+          updateFovOverlay(aladinInstance);
+          updateMountMarker();
+        }, 500);
+
+        window.addEventListener("resize", () => {
+          updateFovOverlay(aladinInstance);
+          updateMountMarker();
+        });
+
+      }).catch(err => {
+        showError("A.init failed: " + (err && err.message ? err.message : String(err)));
+        setStatus("Error");
+      });
+    } catch (err) {
+      showError("Init exception: " + (err && err.message ? err.message : String(err)));
+      setStatus("Error");
+    }
+  };
+
+  s.onerror = () => {
+    showError("Could not load: " + ALADIN_JS);
+    setStatus("Error");
+  };
+
+  document.head.appendChild(s);
+</script>
+</body>
+</html>

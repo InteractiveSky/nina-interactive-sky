@@ -1,0 +1,27 @@
+﻿<!-- =========================
+     File: InteractiveSkyView.xaml
+     ========================= -->
+<UserControl x:Class="NINA.InteractiveSky.InteractiveSkyDockables.InteractiveSkyView"
+             xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+             xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+             xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
+             Focusable="True">
+    <Grid>
+        <!-- Focusable=True is IMPORTANT in docking scenarios -->
+        <wv2:WebView2 x:Name="SkyWebView" Focusable="True" />
+
+        <!-- Debug overlay so we always see what's happening -->
+        <Border x:Name="DebugBar"
+                VerticalAlignment="Top"
+                Background="#AA000000"
+                Padding="8"
+                CornerRadius="0,0,8,8"
+                IsHitTestVisible="False">
+            <TextBlock x:Name="DebugText"
+                       Foreground="White"
+                       FontFamily="Consolas"
+                       FontSize="12"
+                       Text="Loading WebView2..." />
+        </Border>
+    </Grid>
+</UserControl>

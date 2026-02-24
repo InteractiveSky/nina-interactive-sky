@@ -1,0 +1,19 @@
+﻿<ResourceDictionary
+    x:Class="NINA.InteractiveSky.InteractiveSkyDockables.MyPluginDockableTemplates"
+    xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
+    xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
+    xmlns:local="clr-namespace:NINA.InteractiveSky.InteractiveSkyDockables">
+
+    <!-- The DataTemplate key must match: FullNamespace.ClassName_Dockable -->
+    <DataTemplate x:Key="NINA.InteractiveSky.InteractiveSkyDockables.InteractiveSkyDockable_Dockable">
+        <Grid Margin="0">
+            <local:InteractiveSkyView />
+        </Grid>
+    </DataTemplate>
+
+    <!-- Keep an icon (simple circle placeholder) -->
+    <GeometryGroup x:Key="NINA.InteractiveSky_AltitudeSVG">
+        <EllipseGeometry Center="16,16" RadiusX="14" RadiusY="14"/>
+    </GeometryGroup>
+
+</ResourceDictionary>
