@@ -33,7 +33,25 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
         [Import("NINA.Equipment.Interfaces.Mediator.ITelescopeVMMediator", AllowDefault = true)]
         public object TelescopeVmMediator_ByName { get; set; }
 
+        // --------- Plate Solve (NINA 3.x) ----------
+        // Keep compile-safe; resolve at runtime by capability.
+        [Import("NINA.PlateSolve.Interfaces.Mediator.IPlateSolveMediator", AllowDefault = true)]
+        public object PlateSolveMediator_ByName { get; set; }
+
+        [Import("NINA.Imaging.Interfaces.Mediator.IImageSolverMediator", AllowDefault = true)]
+        public object ImageSolverMediator_ByName { get; set; }
+
+        [Import("NINA.PlateSolve.Interfaces.Mediator.IPlateSolveVMMediator", AllowDefault = true)]
+        public object PlateSolveVmMediator_ByName { get; set; }
+        // -------------------------------------------
+
         private object _mountMediator; // resolved runtime mediator (BEST candidate)
+
+        // Plate solve runtime provider
+        private object _solveMediator;
+        private bool _solveEventsHooked = false;
+        private object _solveEventDelegateKeepAlive = null;
+        private PropertyChangedEventHandler _solveInpcHandlerKeepAlive = null;
 
         // Event-hook state (keep delegates alive)
         private bool _mountEventsHooked = false;
@@ -44,6 +62,16 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
         public double SensorWidthMm { get; private set; } = 0;
         public double SensorHeightMm { get; private set; } = 0;
         public double FocalLengthMm { get; private set; } = 800.0;
+
+        // ---- Plate Solve state ----
+        public bool HasPlateSolve { get; private set; } = false;
+
+        // Camera angle / PA in degrees (north-up reference)
+        public double RotationDeg { get; private set; } = 0.0;
+
+        // Optional: expose last solved center (hours / degrees)
+        public double SolveRaHours { get; private set; } = 0.0;
+        public double SolveDecDeg { get; private set; } = 0.0;
 
         // ---- Mount / Target state ----
         public bool MountConnected { get; private set; } = false;
@@ -102,6 +130,11 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             HookMountEventsIfPossible();
             RefreshMountFromMediator(); // initial attempt
 
+            // Resolve plate solve provider + hook events + initial read
+            ResolveSolveMediator();
+            HookSolveEventsIfPossible();
+            RefreshSolveFromMediator(); // initial attempt
+
             // Periodic focal refresh (rare changes; safe)
             _ = Task.Run(async () => {
                 while (!_cts.IsCancellationRequested) {
@@ -126,6 +159,24 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     } catch { }
 
                     await Task.Delay(500, _cts.Token).ConfigureAwait(false);
+                }
+            }, _cts.Token);
+
+            // Hybrid plate-solve watchdog (event-driven best effort + fallback polling)
+            _ = Task.Run(async () => {
+                while (!_cts.IsCancellationRequested) {
+                    try {
+                        ResolveSolveMediator();
+
+                        if (!_solveEventsHooked) {
+                            HookSolveEventsIfPossible();
+                        }
+
+                        // Always attempt refresh (cheap + ensures compatibility)
+                        RefreshSolveFromMediator();
+                    } catch { }
+
+                    await Task.Delay(800, _cts.Token).ConfigureAwait(false);
                 }
             }, _cts.Token);
         }
@@ -192,6 +243,68 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             }
         }
 
+        // =========================
+        // Plate Solve: resolve by capability (last-result provider wins)
+        // =========================
+        private void ResolveSolveMediator() {
+            var candidates = new[] {
+                PlateSolveMediator_ByName,
+                ImageSolverMediator_ByName,
+                PlateSolveVmMediator_ByName
+            }.Where(x => x != null).Distinct().ToArray();
+
+            if (candidates.Length == 0) {
+                _solveMediator = null;
+                return;
+            }
+
+            object best = null;
+            int bestScore = int.MinValue;
+
+            foreach (var c in candidates) {
+                int score = ScoreSolveProvider(c);
+                if (score > bestScore) { bestScore = score; best = c; }
+            }
+
+            if (!ReferenceEquals(_solveMediator, best)) {
+                _solveMediator = best;
+                _solveEventsHooked = false; // re-hook if provider changed
+            }
+        }
+
+        private static int ScoreSolveProvider(object provider) {
+            try {
+                if (provider == null) return int.MinValue;
+                var t = provider.GetType();
+                var props = t.GetProperties(BindingFlags.Public | BindingFlags.Instance);
+                var methods = t.GetMethods(BindingFlags.Public | BindingFlags.Instance);
+                var events = t.GetEvents(BindingFlags.Public | BindingFlags.Instance);
+
+                int score = 0;
+
+                // Strong signals: last solve result availability
+                if (props.Any(p => p.Name.Equals("LastPlateSolveResult", StringComparison.OrdinalIgnoreCase))) score += 5000;
+                if (props.Any(p => p.Name.Equals("LastSolveResult", StringComparison.OrdinalIgnoreCase))) score += 4500;
+                if (props.Any(p => p.Name.Equals("LastResult", StringComparison.OrdinalIgnoreCase))) score += 4000;
+                if (props.Any(p => p.Name.IndexOf("SolveResult", StringComparison.OrdinalIgnoreCase) >= 0)) score += 2500;
+
+                // Events signals
+                if (events.Any(e => e.Name.IndexOf("PlateSolve", StringComparison.OrdinalIgnoreCase) >= 0)) score += 1200;
+                if (events.Any(e => e.Name.IndexOf("Solve", StringComparison.OrdinalIgnoreCase) >= 0)) score += 800;
+                if (events.Any(e => e.Name.IndexOf("Completed", StringComparison.OrdinalIgnoreCase) >= 0)) score += 600;
+
+                // Methods signals
+                if (methods.Any(m => m.Name.IndexOf("Solve", StringComparison.OrdinalIgnoreCase) >= 0)) score += 200;
+
+                // INPC bonus
+                if (typeof(INotifyPropertyChanged).IsAssignableFrom(t)) score += 400;
+
+                return score;
+            } catch {
+                return 0;
+            }
+        }
+
         // Called by NINA when camera info changes
         public void UpdateDeviceInfo(CameraInfo deviceInfo) {
             try {
@@ -247,6 +360,12 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 }
             } catch { }
 
+            try {
+                if (_solveMediator is INotifyPropertyChanged inpc2 && _solveInpcHandlerKeepAlive != null) {
+                    inpc2.PropertyChanged -= _solveInpcHandlerKeepAlive;
+                }
+            } catch { }
+
             try { _cameraMediator.RemoveConsumer(this); } catch { }
         }
 
@@ -258,6 +377,133 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             if (focal > 0 && Math.Abs(focal - FocalLengthMm) > 0.001) {
                 FocalLengthMm = focal;
                 RaiseOnUi(nameof(FocalLengthMm));
+            }
+        }
+
+        // ----------------- Plate Solve updates (event-driven best-effort + fallback) -----------------
+
+        private void HookSolveEventsIfPossible() {
+            if (_solveEventsHooked) return;
+            if (_solveMediator == null) return;
+
+            try {
+                if (_solveMediator is INotifyPropertyChanged inpc) {
+                    _solveInpcHandlerKeepAlive = (_, __) => {
+                        try { RefreshSolveFromMediator(); } catch { }
+                    };
+                    inpc.PropertyChanged -= _solveInpcHandlerKeepAlive;
+                    inpc.PropertyChanged += _solveInpcHandlerKeepAlive;
+                    _solveEventsHooked = true;
+                    return;
+                }
+
+                EventHandler handler = (_, __) => {
+                    try { RefreshSolveFromMediator(); } catch { }
+                };
+
+                // Try common event names across builds
+                if (TryHookEvent(_solveMediator, "PlateSolveCompleted", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "SolveCompleted", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "SolverCompleted", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "ResultChanged", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "LastResultChanged", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "PlateSolveResultChanged", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "SolutionChanged", handler, ref _solveEventDelegateKeepAlive)) {
+                    _solveEventsHooked = true;
+                    return;
+                }
+            } catch { }
+        }
+
+        private void RefreshSolveFromMediator() {
+            if (_solveMediator == null) {
+                SetNoSolve();
+                return;
+            }
+
+            try {
+                object result = null;
+
+                // Common property patterns
+                result = GetProp(_solveMediator, "LastPlateSolveResult");
+                if (result == null) result = GetProp(_solveMediator, "LastSolveResult");
+                if (result == null) result = GetProp(_solveMediator, "LastResult");
+                if (result == null) result = GetProp(_solveMediator, "SolveResult");
+                if (result == null) result = GetProp(_solveMediator, "Result");
+
+                // Some mediators expose result via Info/State container
+                if (result == null) {
+                    var info = GetProp(_solveMediator, "Info") ?? GetProp(_solveMediator, "State") ?? GetProp(_solveMediator, "DeviceInfo");
+                    if (info != null) {
+                        result = GetProp(info, "LastPlateSolveResult") ?? GetProp(info, "LastSolveResult") ?? GetProp(info, "LastResult");
+                    }
+                }
+
+                if (result == null) {
+                    SetNoSolve();
+                    return;
+                }
+
+                // Determine success (different names exist)
+                bool success =
+                    ReadBool(result, new[] { "Success", "Solved", "IsSuccess", "IsSolved", "PlateSolved" });
+
+                // If no explicit success prop exists, we accept "has rotation + has RA/Dec" as solved.
+                double rot =
+                    ReadDouble(result, new[] { "PositionAngle", "Rotation", "RotationDeg", "PA", "Angle" });
+
+                // Read RA/Dec (hours preferred)
+                double raHours = ReadDouble(result, new[] { "RightAscension", "RA", "Ra", "RightAscensionHours", "RaHours" });
+                if (raHours == 0) {
+                    double raDeg = ReadDouble(result, new[] { "RightAscensionDegrees", "RaDegrees", "RADegrees", "RightAscensionDeg" });
+                    if (raDeg != 0) raHours = raDeg / 15.0;
+                }
+
+                double decDeg = ReadDouble(result, new[] { "Declination", "DEC", "Dec", "DeclinationDegrees", "DecDegrees" });
+
+                bool inferredSolved = (rot != 0 || (rot == 0 && ReadBool(result, new[] { "Success", "Solved", "IsSuccess", "IsSolved" })))
+                                      && (raHours != 0 || decDeg != 0);
+
+                if (!success && !inferredSolved) {
+                    SetNoSolve();
+                    return;
+                }
+
+                // Update fields (only raise if changed to reduce UI churn)
+                bool anyChanged = false;
+
+                if (HasPlateSolve != true) { HasPlateSolve = true; anyChanged = true; RaiseOnUi(nameof(HasPlateSolve)); }
+
+                if (double.IsFinite(rot) && Math.Abs(rot - RotationDeg) > 0.0001) {
+                    RotationDeg = rot;
+                    anyChanged = true;
+                    RaiseOnUi(nameof(RotationDeg));
+                }
+
+                if (double.IsFinite(raHours) && Math.Abs(raHours - SolveRaHours) > 0.000001) {
+                    SolveRaHours = raHours;
+                    anyChanged = true;
+                    RaiseOnUi(nameof(SolveRaHours));
+                }
+
+                if (double.IsFinite(decDeg) && Math.Abs(decDeg - SolveDecDeg) > 0.000001) {
+                    SolveDecDeg = decDeg;
+                    anyChanged = true;
+                    RaiseOnUi(nameof(SolveDecDeg));
+                }
+
+                // If solved but rotation is exactly 0, we keep it (some solves can be ~0),
+                // but your UI overlay + warning uses HasPlateSolve, not rotation.
+                _ = anyChanged;
+            } catch {
+                SetNoSolve();
+            }
+        }
+
+        private void SetNoSolve() {
+            if (HasPlateSolve != false) {
+                HasPlateSolve = false;
+                RaiseOnUi(nameof(HasPlateSolve));
             }
         }
 

@@ -70,7 +70,11 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 e.PropertyName == nameof(InteractiveSkyDockable.MountRaHours) ||
                 e.PropertyName == nameof(InteractiveSkyDockable.MountDecDeg) ||
                 e.PropertyName == nameof(InteractiveSkyDockable.TargetRaHours) ||
-                e.PropertyName == nameof(InteractiveSkyDockable.TargetDecDeg)) {
+                e.PropertyName == nameof(InteractiveSkyDockable.TargetDecDeg) ||
+                e.PropertyName == nameof(InteractiveSkyDockable.HasPlateSolve) ||
+                e.PropertyName == nameof(InteractiveSkyDockable.RotationDeg) ||
+                e.PropertyName == nameof(InteractiveSkyDockable.SolveRaHours) ||
+                e.PropertyName == nameof(InteractiveSkyDockable.SolveDecDeg)) {
 
                 TrySendSkyState("VMChanged:" + e.PropertyName);
             }
@@ -238,7 +242,11 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     sensorWidth_mm = vm.SensorWidthMm,
                     sensorHeight_mm = vm.SensorHeightMm,
                     focalLength_mm = vm.FocalLengthMm,
-                    rotationDeg = 0.0,
+                    rotationDeg = vm.RotationDeg,
+
+                    hasPlateSolve = vm.HasPlateSolve,
+                    solveRaHours = vm.SolveRaHours,
+                    solveDecDeg = vm.SolveDecDeg,
 
                     mountConnected = vm.MountConnected,
                     mountRaHours = vm.MountRaHours,
@@ -253,7 +261,8 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
                 var msg =
                     $"Sent sky ✅ ({reason})  " +
-                    $"Mount: {(vm.MountConnected ? "ON" : "OFF")} RA {vm.MountRaHours:0.000}h Dec {vm.MountDecDeg:0.00}°";
+                    $"Mount: {(vm.MountConnected ? "ON" : "OFF")} RA {vm.MountRaHours:0.000}h Dec {vm.MountDecDeg:0.00}°  " +
+                    $"Solve: {(vm.HasPlateSolve ? "YES" : "NO")} Rot {vm.RotationDeg:0.0}°";
 
                 if (!string.Equals(reason, "Heartbeat", StringComparison.OrdinalIgnoreCase)) {
                     _lastNonHeartbeatDebug = msg;

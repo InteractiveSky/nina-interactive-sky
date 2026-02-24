@@ -120,8 +120,38 @@
     }
     .btn:active { transform: translateY(1px); }
 
-
     #title { display:none !important; }
+
+    /* ===== Plate Solve Needed Overlay (High-end) ===== */
+    #needSolve {
+      position:absolute;
+      left:50%;
+      top:50%;
+      transform:translate(-50%,-50%);
+      padding:22px 26px;
+      border-radius:16px;
+      background:rgba(14,14,24,.82);
+      border:1px solid rgba(255,255,255,.16);
+      box-shadow:0 16px 60px rgba(0,0,0,.55);
+      color:#f5f5ff;
+      text-align:center;
+      z-index:40;
+      display:none;
+      pointer-events:auto;
+      backdrop-filter: blur(10px);
+      -webkit-backdrop-filter: blur(10px);
+    }
+    #needSolve .big {
+      font-size:18px;
+      font-weight:800;
+      letter-spacing:.2px;
+    }
+    #needSolve .small {
+      margin-top:8px;
+      font-size:13px;
+      opacity:.78;
+      line-height:1.35;
+    }
   </style>
 </head>
 
@@ -147,6 +177,11 @@
     <div id="btnSyncSlew" class="btn btnPrimary">Sync Scope to FOV (Slew)</div>
   </div>
 
+  <div id="needSolve">
+    <div class="big">Plate-Solve First</div>
+    <div class="small">Accurate framing requires a solved image.<br/>Run Plate Solve in NINA, then return here.</div>
+  </div>
+
   <div id="error"></div>
 </div>
 
@@ -156,6 +191,10 @@
   let SENSOR_HEIGHT_MM = 14.9;
   let FOCAL_LENGTH_MM  = 800.0;
   let ROTATION_DEG     = 0.0;
+
+  let HAS_PLATESOLVE   = false;
+  let SOLVE_RA_HOURS   = 0.0;
+  let SOLVE_DEC_DEG    = 0.0;
 
   let MOUNT_CONNECTED = false;
   let MOUNT_RA_HOURS  = 0.0;
@@ -173,6 +212,7 @@
   const fovRect  = document.getElementById("fovRect");
   const mountRect= document.getElementById("mountRect");
   const btnSyncSlew = document.getElementById("btnSyncSlew");
+  const needSolveEl = document.getElementById("needSolve");
 
   let aladinInstance = null;
   let cameraFov = null;
@@ -235,6 +275,18 @@
     } catch {}
   }
 
+  function updateSolveOverlay(){
+    // High-end behavior:
+    // If no plate solve, show overlay and mute FOV a bit.
+    if (!HAS_PLATESOLVE) {
+      needSolveEl.style.display = "block";
+      fovRect.style.opacity = "0.45";
+    } else {
+      needSolveEl.style.display = "none";
+      fovRect.style.opacity = "1.0";
+    }
+  }
+
   function updateFovOverlay(aladin){
     if (!cameraFov) cameraFov = computeCameraFovDeg();
 
@@ -268,6 +320,7 @@
       `Ready ✅ (${LOCK_ALADIN_ROTATION ? "north up" : "rotation free"})\n` +
       `sensor: ${SENSOR_WIDTH_MM.toFixed(2)}×${SENSOR_HEIGHT_MM.toFixed(2)} mm  focal: ${FOCAL_LENGTH_MM.toFixed(1)} mm\n` +
       `camera: ${cameraFov.fovW.toFixed(2)}° x ${cameraFov.fovH.toFixed(2)}°  viewFov: ${viewFovDeg.toFixed(3)}°\n` +
+      `solve: ${HAS_PLATESOLVE ? "YES" : "NO"}  rot: ${ROTATION_DEG.toFixed(1)}°\n` +
       `mount: ${MOUNT_CONNECTED ? "ON" : "OFF"}  RA ${MOUNT_RA_HOURS.toFixed(3)}h  Dec ${MOUNT_DEC_DEG.toFixed(2)}°\n` +
       `target: RA ${TARGET_RA_HOURS.toFixed(3)}h  Dec ${TARGET_DEC_DEG.toFixed(2)}°`
     );
@@ -376,6 +429,10 @@
         if (typeof msg.focalLength_mm === "number")  FOCAL_LENGTH_MM = msg.focalLength_mm;
         if (typeof msg.rotationDeg === "number")     ROTATION_DEG = msg.rotationDeg;
 
+        if (typeof msg.hasPlateSolve === "boolean")  HAS_PLATESOLVE = msg.hasPlateSolve;
+        if (typeof msg.solveRaHours === "number")    SOLVE_RA_HOURS = msg.solveRaHours;
+        if (typeof msg.solveDecDeg === "number")     SOLVE_DEC_DEG = msg.solveDecDeg;
+
         if (typeof msg.mountConnected === "boolean") MOUNT_CONNECTED = msg.mountConnected;
         if (typeof msg.mountRaHours === "number")    MOUNT_RA_HOURS = msg.mountRaHours;
         if (typeof msg.mountDecDeg === "number")     MOUNT_DEC_DEG = msg.mountDecDeg;
@@ -385,6 +442,7 @@
 
         cameraFov = computeCameraFovDeg();
         setOverlayRotationDeg(ROTATION_DEG);
+        updateSolveOverlay();
 
         if (aladinInstance) {
           enforceAladinRotationLock();
@@ -427,6 +485,7 @@
 
         setOverlayRotationDeg(ROTATION_DEG);
         cameraFov = computeCameraFovDeg();
+        updateSolveOverlay();
         updateFovOverlay(aladinInstance);
         updateMountMarker();
 
@@ -471,6 +530,7 @@
 
         setInterval(() => {
           enforceAladinRotationLock();
+          updateSolveOverlay();
           updateFovOverlay(aladinInstance);
           updateMountMarker();
         }, 500);
