@@ -452,9 +452,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 double rot =
                     ReadDouble(result, new[] { "PositionAngle", "Rotation", "RotationDeg", "PA", "Angle" });
 
-                // Normalize solve rotation to [0, 360)
-                rot = NormalizeDeg360(rot);
-
                 // Read RA/Dec (hours preferred)
                 double raHours = ReadDouble(result, new[] { "RightAscension", "RA", "Ra", "RightAscensionHours", "RaHours" });
                 if (raHours == 0) {
@@ -926,14 +923,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             while (raHours >= 24) raHours -= 24;
             return raHours;
         }
-
-        private static double NormalizeDeg360(double deg) {
-            if (double.IsNaN(deg) || double.IsInfinity(deg)) return 0.0;
-            deg %= 360.0;
-            if (deg < 0) deg += 360.0;
-            return deg;
-        }
-
 
         // ---- Cache ----
         private void LoadCache() {
