@@ -1,4 +1,7 @@
-﻿using NINA.Equipment.Equipment.MyCamera;
+﻿// =========================
+// File: InteractiveSkyDockable.cs
+// =========================
+using NINA.Equipment.Equipment.MyCamera;
 using NINA.Equipment.Interfaces.Mediator;
 using NINA.Equipment.Interfaces.ViewModel;
 using NINA.Profile.Interfaces;
@@ -6,10 +9,13 @@ using NINA.WPF.Base.ViewModel;
 using System;
 using System.ComponentModel;
 using System.ComponentModel.Composition;
+using System.Globalization;
 using System.IO;
 using System.Linq;
 using System.Reflection;
+using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Windows;
@@ -34,7 +40,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
         public object TelescopeVmMediator_ByName { get; set; }
 
         // --------- Plate Solve (NINA 3.x) ----------
-        // Keep compile-safe; resolve at runtime by capability.
+        // Different builds expose different mediators/names.
         [Import("NINA.PlateSolve.Interfaces.Mediator.IPlateSolveMediator", AllowDefault = true)]
         public object PlateSolveMediator_ByName { get; set; }
 
@@ -43,6 +49,16 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
         [Import("NINA.PlateSolve.Interfaces.Mediator.IPlateSolveVMMediator", AllowDefault = true)]
         public object PlateSolveVmMediator_ByName { get; set; }
+
+        // EXTRA candidates (some builds rename/move these)
+        [Import("NINA.Imaging.Interfaces.Mediator.IImageSolverVMMediator", AllowDefault = true)]
+        public object ImageSolverVmMediator_ByName { get; set; }
+
+        [Import("NINA.PlateSolve.Interfaces.Mediator.IImageSolverMediator", AllowDefault = true)]
+        public object PlateSolveImageSolverMediator_ByName { get; set; }
+
+        [Import("NINA.PlateSolve.Interfaces.Mediator.IImageSolverVMMediator", AllowDefault = true)]
+        public object PlateSolveImageSolverVmMediator_ByName { get; set; }
         // -------------------------------------------
 
         private object _mountMediator; // resolved runtime mediator (BEST candidate)
@@ -86,6 +102,12 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
         // Background tasks control
         private readonly CancellationTokenSource _cts = new CancellationTokenSource();
+
+        // --------- NEW: Log tail fallback for Plate Solve ----------
+        // If mediators don't expose last solve result, we parse NINA logs:
+        // "Platesolve successful: Coordinates: RA: 05:34:12; Dec: -05° 28' 12\"; ... - Position Angle: 23.50"
+        private readonly NinaLogTailer _logTailer;
+        // ----------------------------------------------------------
 
         [ImportingConstructor]
         public InteractiveSkyDockable(IProfileService profileService, ICameraMediator cameraMediator) : base(profileService) {
@@ -135,6 +157,10 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             HookSolveEventsIfPossible();
             RefreshSolveFromMediator(); // initial attempt
 
+            // NEW: start log tailer fallback (works even if mediators don't expose results)
+            _logTailer = new NinaLogTailer(_cts.Token, ApplySolveFromLog);
+            _logTailer.Start();
+
             // Periodic focal refresh (rare changes; safe)
             _ = Task.Run(async () => {
                 while (!_cts.IsCancellationRequested) {
@@ -176,7 +202,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                         RefreshSolveFromMediator();
                     } catch { }
 
-                    await Task.Delay(800, _cts.Token).ConfigureAwait(false);
+                    await Task.Delay(700, _cts.Token).ConfigureAwait(false);
                 }
             }, _cts.Token);
         }
@@ -196,7 +222,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 return;
             }
 
-            // Pick best candidate by scoring its public API.
             object best = null;
             int bestScore = int.MinValue;
 
@@ -205,10 +230,9 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 if (score > bestScore) { bestScore = score; best = c; }
             }
 
-            // Only replace if changed (avoid re-hooking churn)
             if (!ReferenceEquals(_mountMediator, best)) {
                 _mountMediator = best;
-                _mountEventsHooked = false; // force re-hook on new object
+                _mountEventsHooked = false;
             }
         }
 
@@ -223,17 +247,14 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 bool hasAnySlew = methods.Any(m => m.Name.IndexOf("Slew", StringComparison.OrdinalIgnoreCase) >= 0);
                 if (hasAnySlew) score += 5000;
 
-                // Very strong signals
                 if (methods.Any(m => m.Name.Contains("SlewToCoordinates", StringComparison.OrdinalIgnoreCase))) score += 3000;
                 if (methods.Any(m => m.Name.Contains("SlewToRaDec", StringComparison.OrdinalIgnoreCase))) score += 3000;
                 if (methods.Any(m => m.Name.Contains("SlewToTopocentric", StringComparison.OrdinalIgnoreCase))) score += 3000;
 
-                // Bonus signals
                 if (methods.Any(m => m.Name.Contains("Abort", StringComparison.OrdinalIgnoreCase))) score += 300;
                 if (methods.Any(m => m.Name.Contains("Stop", StringComparison.OrdinalIgnoreCase))) score += 300;
                 if (methods.Any(m => m.Name.Contains("Sync", StringComparison.OrdinalIgnoreCase))) score += 200;
 
-                // Connected property bonus
                 if (t.GetProperty("Connected", BindingFlags.Public | BindingFlags.Instance) != null) score += 100;
                 if (t.GetProperty("IsConnected", BindingFlags.Public | BindingFlags.Instance) != null) score += 100;
 
@@ -250,7 +271,10 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             var candidates = new[] {
                 PlateSolveMediator_ByName,
                 ImageSolverMediator_ByName,
-                PlateSolveVmMediator_ByName
+                PlateSolveVmMediator_ByName,
+                ImageSolverVmMediator_ByName,
+                PlateSolveImageSolverMediator_ByName,
+                PlateSolveImageSolverVmMediator_ByName
             }.Where(x => x != null).Distinct().ToArray();
 
             if (candidates.Length == 0) {
@@ -268,7 +292,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
             if (!ReferenceEquals(_solveMediator, best)) {
                 _solveMediator = best;
-                _solveEventsHooked = false; // re-hook if provider changed
+                _solveEventsHooked = false;
             }
         }
 
@@ -282,22 +306,19 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
                 int score = 0;
 
-                // Strong signals: last solve result availability
-                if (props.Any(p => p.Name.Equals("LastPlateSolveResult", StringComparison.OrdinalIgnoreCase))) score += 5000;
-                if (props.Any(p => p.Name.Equals("LastSolveResult", StringComparison.OrdinalIgnoreCase))) score += 4500;
-                if (props.Any(p => p.Name.Equals("LastResult", StringComparison.OrdinalIgnoreCase))) score += 4000;
+                if (props.Any(p => p.Name.Equals("LastPlateSolveResult", StringComparison.OrdinalIgnoreCase))) score += 6000;
+                if (props.Any(p => p.Name.Equals("LastSolveResult", StringComparison.OrdinalIgnoreCase))) score += 5500;
+                if (props.Any(p => p.Name.Equals("LastResult", StringComparison.OrdinalIgnoreCase))) score += 5000;
                 if (props.Any(p => p.Name.IndexOf("SolveResult", StringComparison.OrdinalIgnoreCase) >= 0)) score += 2500;
 
-                // Events signals
                 if (events.Any(e => e.Name.IndexOf("PlateSolve", StringComparison.OrdinalIgnoreCase) >= 0)) score += 1200;
                 if (events.Any(e => e.Name.IndexOf("Solve", StringComparison.OrdinalIgnoreCase) >= 0)) score += 800;
                 if (events.Any(e => e.Name.IndexOf("Completed", StringComparison.OrdinalIgnoreCase) >= 0)) score += 600;
+                if (events.Any(e => e.Name.IndexOf("Result", StringComparison.OrdinalIgnoreCase) >= 0)) score += 500;
 
-                // Methods signals
                 if (methods.Any(m => m.Name.IndexOf("Solve", StringComparison.OrdinalIgnoreCase) >= 0)) score += 200;
 
-                // INPC bonus
-                if (typeof(INotifyPropertyChanged).IsAssignableFrom(t)) score += 400;
+                if (typeof(INotifyPropertyChanged).IsAssignableFrom(t)) score += 700;
 
                 return score;
             } catch {
@@ -366,6 +387,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 }
             } catch { }
 
+            try { _logTailer?.Dispose(); } catch { }
             try { _cameraMediator.RemoveConsumer(this); } catch { }
         }
 
@@ -408,7 +430,9 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     TryHookEvent(_solveMediator, "ResultChanged", handler, ref _solveEventDelegateKeepAlive) ||
                     TryHookEvent(_solveMediator, "LastResultChanged", handler, ref _solveEventDelegateKeepAlive) ||
                     TryHookEvent(_solveMediator, "PlateSolveResultChanged", handler, ref _solveEventDelegateKeepAlive) ||
-                    TryHookEvent(_solveMediator, "SolutionChanged", handler, ref _solveEventDelegateKeepAlive)) {
+                    TryHookEvent(_solveMediator, "SolutionChanged", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "ImageSolved", handler, ref _solveEventDelegateKeepAlive) ||
+                    TryHookEvent(_solveMediator, "SolveResultChanged", handler, ref _solveEventDelegateKeepAlive)) {
                     _solveEventsHooked = true;
                     return;
                 }
@@ -417,94 +441,132 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
         private void RefreshSolveFromMediator() {
             if (_solveMediator == null) {
-                SetNoSolve();
+                // do NOT force-no-solve; log tailer may still provide it
                 return;
             }
 
             try {
-                object result = null;
+                object result = FindAnySolveResultObject(_solveMediator);
 
-                // Common property patterns
-                result = GetProp(_solveMediator, "LastPlateSolveResult");
-                if (result == null) result = GetProp(_solveMediator, "LastSolveResult");
-                if (result == null) result = GetProp(_solveMediator, "LastResult");
-                if (result == null) result = GetProp(_solveMediator, "SolveResult");
-                if (result == null) result = GetProp(_solveMediator, "Result");
-
-                // Some mediators expose result via Info/State container
                 if (result == null) {
-                    var info = GetProp(_solveMediator, "Info") ?? GetProp(_solveMediator, "State") ?? GetProp(_solveMediator, "DeviceInfo");
-                    if (info != null) {
-                        result = GetProp(info, "LastPlateSolveResult") ?? GetProp(info, "LastSolveResult") ?? GetProp(info, "LastResult");
+                    // do NOT force-no-solve; log tailer may still provide it
+                    return;
+                }
+
+                bool success =
+                    ReadBool(result, new[] { "Success", "Solved", "IsSuccess", "IsSolved", "PlateSolved", "HasSolution" });
+
+                double rot =
+                    ReadDouble(result, new[] { "PositionAngle", "PositionAngleDeg", "Rotation", "RotationDeg", "PA", "Angle" });
+
+                double raHours = ReadRaHours(result);
+                double decDeg = ReadDecDeg(result);
+
+                if ((raHours == 0 && decDeg == 0) || double.IsNaN(raHours) || double.IsNaN(decDeg)) {
+                    var coords = GetProp(result, "Coordinates") ?? GetProp(result, "Center") ?? GetProp(result, "Coo") ?? GetProp(result, "SolvedCoordinates");
+                    if (coords != null) {
+                        if (raHours == 0) raHours = ReadRaHours(coords);
+                        if (decDeg == 0) decDeg = ReadDecDeg(coords);
+                        if (rot == 0) {
+                            rot = ReadDouble(coords, new[] { "PositionAngle", "Rotation", "RotationDeg", "PA", "Angle" });
+                        }
                     }
                 }
 
-                if (result == null) {
-                    SetNoSolve();
-                    return;
-                }
+                rot = NormalizeAngleToDegrees(rot, result);
 
-                // Determine success (different names exist)
-                bool success =
-                    ReadBool(result, new[] { "Success", "Solved", "IsSuccess", "IsSolved", "PlateSolved" });
+                bool inferredSolved = (raHours != 0 || decDeg != 0) && (success || HasAnySolveFlag(result));
+                if (!success && !inferredSolved) return;
 
-                // If no explicit success prop exists, we accept "has rotation + has RA/Dec" as solved.
-                double rot =
-                    ReadDouble(result, new[] { "PositionAngle", "Rotation", "RotationDeg", "PA", "Angle" });
-
-                // Read RA/Dec (hours preferred)
-                double raHours = ReadDouble(result, new[] { "RightAscension", "RA", "Ra", "RightAscensionHours", "RaHours" });
-                if (raHours == 0) {
-                    double raDeg = ReadDouble(result, new[] { "RightAscensionDegrees", "RaDegrees", "RADegrees", "RightAscensionDeg" });
-                    if (raDeg != 0) raHours = raDeg / 15.0;
-                }
-
-                double decDeg = ReadDouble(result, new[] { "Declination", "DEC", "Dec", "DeclinationDegrees", "DecDegrees" });
-
-                bool inferredSolved = (rot != 0 || (rot == 0 && ReadBool(result, new[] { "Success", "Solved", "IsSuccess", "IsSolved" })))
-                                      && (raHours != 0 || decDeg != 0);
-
-                if (!success && !inferredSolved) {
-                    SetNoSolve();
-                    return;
-                }
-
-                // Update fields (only raise if changed to reduce UI churn)
-                bool anyChanged = false;
-
-                if (HasPlateSolve != true) { HasPlateSolve = true; anyChanged = true; RaiseOnUi(nameof(HasPlateSolve)); }
-
-                if (double.IsFinite(rot) && Math.Abs(rot - RotationDeg) > 0.0001) {
-                    RotationDeg = rot;
-                    anyChanged = true;
-                    RaiseOnUi(nameof(RotationDeg));
-                }
-
-                if (double.IsFinite(raHours) && Math.Abs(raHours - SolveRaHours) > 0.000001) {
-                    SolveRaHours = raHours;
-                    anyChanged = true;
-                    RaiseOnUi(nameof(SolveRaHours));
-                }
-
-                if (double.IsFinite(decDeg) && Math.Abs(decDeg - SolveDecDeg) > 0.000001) {
-                    SolveDecDeg = decDeg;
-                    anyChanged = true;
-                    RaiseOnUi(nameof(SolveDecDeg));
-                }
-
-                // If solved but rotation is exactly 0, we keep it (some solves can be ~0),
-                // but your UI overlay + warning uses HasPlateSolve, not rotation.
-                _ = anyChanged;
+                ApplySolve(raHours, decDeg, rot);
             } catch {
-                SetNoSolve();
+                // ignore; log tailer might still work
             }
         }
 
-        private void SetNoSolve() {
-            if (HasPlateSolve != false) {
-                HasPlateSolve = false;
-                RaiseOnUi(nameof(HasPlateSolve));
+        private void ApplySolve(double raHours, double decDeg, double rotDeg) {
+            // If nothing is valid, ignore
+            if (!double.IsFinite(raHours) || !double.IsFinite(decDeg)) return;
+
+            // Normalize / clamp
+            raHours = NormalizeHours(raHours);
+            decDeg = Math.Max(-90, Math.Min(90, decDeg));
+
+            bool anyChange = false;
+
+            if (HasPlateSolve != true) { HasPlateSolve = true; anyChange = true; RaiseOnUi(nameof(HasPlateSolve)); }
+
+            if (double.IsFinite(rotDeg)) {
+                // normalize to 0..360
+                rotDeg = rotDeg % 360.0;
+                if (rotDeg < 0) rotDeg += 360.0;
+                if (Math.Abs(rotDeg - RotationDeg) > 0.0001) { RotationDeg = rotDeg; anyChange = true; RaiseOnUi(nameof(RotationDeg)); }
             }
+
+            if (Math.Abs(raHours - SolveRaHours) > 0.000001) { SolveRaHours = raHours; anyChange = true; RaiseOnUi(nameof(SolveRaHours)); }
+            if (Math.Abs(decDeg - SolveDecDeg) > 0.000001) { SolveDecDeg = decDeg; anyChange = true; RaiseOnUi(nameof(SolveDecDeg)); }
+
+            if (!anyChange) return;
+        }
+
+        private void ApplySolveFromLog(NinaSolveLine solve) {
+            try {
+                ApplySolve(solve.RaHours, solve.DecDeg, solve.PositionAngleDeg);
+            } catch { }
+        }
+
+        private static object FindAnySolveResultObject(object mediator) {
+            if (mediator == null) return null;
+
+            object result =
+                GetProp(mediator, "LastPlateSolveResult") ??
+                GetProp(mediator, "LastSolveResult") ??
+                GetProp(mediator, "LastResult") ??
+                GetProp(mediator, "SolveResult") ??
+                GetProp(mediator, "Result") ??
+                GetProp(mediator, "CurrentResult");
+
+            if (result != null) return result;
+
+            var info =
+                GetProp(mediator, "Info") ??
+                GetProp(mediator, "State") ??
+                GetProp(mediator, "DeviceInfo") ??
+                GetProp(mediator, "LastInfo") ??
+                GetProp(mediator, "SolverState") ??
+                GetProp(mediator, "PlateSolveState");
+
+            if (info != null) {
+                result =
+                    GetProp(info, "LastPlateSolveResult") ??
+                    GetProp(info, "LastSolveResult") ??
+                    GetProp(info, "LastResult") ??
+                    GetProp(info, "SolveResult") ??
+                    GetProp(info, "Result") ??
+                    GetProp(info, "CurrentResult");
+                if (result != null) return result;
+            }
+
+            var last = GetProp(mediator, "Last") ?? GetProp(mediator, "Latest");
+            if (last != null) {
+                result =
+                    GetProp(last, "PlateSolveResult") ??
+                    GetProp(last, "SolveResult") ??
+                    GetProp(last, "Result");
+                if (result != null) return result;
+            }
+
+            return null;
+        }
+
+        private static bool HasAnySolveFlag(object result) {
+            if (result == null) return false;
+            if (ReadBool(result, new[] { "Success", "Solved", "IsSuccess", "IsSolved", "PlateSolved", "HasSolution" })) return true;
+
+            var raAny = GetAnyProp(result, new[] { "RightAscension", "RA", "Ra", "RightAscensionHours", "RaHours", "RightAscensionDegrees", "RaDegrees" });
+            var decAny = GetAnyProp(result, new[] { "Declination", "DEC", "Dec", "DeclinationDegrees", "DecDegrees" });
+
+            return raAny != null || decAny != null;
         }
 
         // ----------------- Mount updates (event-driven best-effort + fallback) -----------------
@@ -587,13 +649,8 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
                 if (!connected) return;
 
-                double raHours = ReadDouble(info, new[] { "RightAscension", "RA", "Ra", "RightAscensionHours", "RaHours" });
-                if (raHours == 0) {
-                    double raDeg = ReadDouble(info, new[] { "RightAscensionDegrees", "RaDegrees", "RADegrees", "RightAscensionDeg" });
-                    if (raDeg != 0) raHours = raDeg / 15.0;
-                }
-
-                double decDeg = ReadDouble(info, new[] { "Declination", "DEC", "Dec", "DeclinationDegrees", "DecDegrees" });
+                double raHours = ReadRaHours(info);
+                double decDeg = ReadDecDeg(info);
 
                 bool changed = false;
                 if (Math.Abs(raHours - MountRaHours) > 0.000001) { MountRaHours = raHours; changed = true; }
@@ -619,10 +676,9 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
         // FIXED: Slew using Coordinates/TopocentricCoordinates (NINA TelescopeMediator expects objects)
         // =========================
         public async Task SlewToTargetAsync() {
-            ResolveMountMediator(); // re-evaluate right before slew
+            ResolveMountMediator();
             if (_mountMediator == null) return;
 
-            // Refresh state right before slewing
             try { RefreshMountFromMediator(); } catch { }
 
             var raHours = NormalizeHours(TargetRaHours);
@@ -630,16 +686,9 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             var raDeg = raHours * 15.0;
 
             await RunOnUiAsync(async () => {
-                // 0) FIRST: try object-based slews (this is what your log shows is available)
                 if (await TryInvokeCoordinatesBasedSlewAsync(_mountMediator, raHours, raDeg, decDeg).ConfigureAwait(false)) return;
-
-                // 1) Then try known numeric names (some mediators have them)
                 if (await TryInvokeKnownSlewNamesAsync(_mountMediator, raHours, decDeg).ConfigureAwait(false)) return;
-
-                // 2) Try known names (degrees)
                 if (await TryInvokeKnownSlewNamesAsync(_mountMediator, raDeg, decDeg).ConfigureAwait(false)) return;
-
-                // 3) Scan any public method containing "Slew" with numeric args
                 await TryInvokeSlewByScanningAsync(_mountMediator, raHours, raDeg, decDeg).ConfigureAwait(false);
             }).ConfigureAwait(false);
         }
@@ -648,11 +697,9 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             try {
                 if (mediator == null) return false;
 
-                // Build Coordinates (prefer degrees), fallback to TopocentricCoordinates (degrees)
                 object coords = BuildAstrometryObject("NINA.Astrometry.Coordinates", raHours, raDeg, decDeg);
                 object topo = BuildAstrometryObject("NINA.Astrometry.TopocentricCoordinates", raHours, raDeg, decDeg);
 
-                // TelescopeMediator in your log: SlewToCoordinatesAsync(Coordinates coords, CancellationToken token)
                 if (coords != null) {
                     object taskObj =
                         InvokeIfExistsLoose(mediator, "SlewToCoordinatesAsync", coords, CancellationToken.None) ??
@@ -661,7 +708,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     if (await AwaitIfTask(taskObj).ConfigureAwait(false)) return true;
                 }
 
-                // Overload: SlewToCoordinatesAsync(TopocentricCoordinates coords, CancellationToken token)
                 if (topo != null) {
                     object taskObj =
                         InvokeIfExistsLoose(mediator, "SlewToCoordinatesAsync", topo, CancellationToken.None) ??
@@ -670,7 +716,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     if (await AwaitIfTask(taskObj).ConfigureAwait(false)) return true;
                 }
 
-                // Some builds have SlewToTopocentricCoordinates(TopocentricCoordinates coords, CancellationToken token)
                 if (topo != null) {
                     object taskObj =
                         InvokeIfExistsLoose(mediator, "SlewToTopocentricCoordinates", topo, CancellationToken.None);
@@ -682,9 +727,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             return false;
         }
 
-        private static CancellationToken _NoCancelTokenOrDefault() {
-            return CancellationToken.None;
-        }
+        private static CancellationToken _NoCancelTokenOrDefault() => CancellationToken.None;
 
         private static async Task<bool> AwaitIfTask(object taskObj) {
             try {
@@ -693,41 +736,31 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 if (taskObj is Task t) {
                     await t.ConfigureAwait(false);
 
-                    // If it was Task<bool> (Task`1), read Result via reflection
                     var tt = taskObj.GetType();
                     if (tt.IsGenericType && tt.GetProperty("Result") != null) {
                         try {
                             var r = tt.GetProperty("Result")?.GetValue(taskObj);
-                            if (r is bool b) return b; // true = slewed; false = refused
+                            if (r is bool b) return b;
                         } catch { }
                     }
-
-                    // Task completed, treat as success
                     return true;
                 }
-
-                // non-task return
                 return true;
             } catch {
                 return false;
             }
         }
 
-        // Builds NINA.Astrometry.Coordinates or NINA.Astrometry.TopocentricCoordinates via reflection
-        // Tries constructors first; if not possible, creates empty and sets properties.
         private static object BuildAstrometryObject(string fullTypeName, double raHours, double raDeg, double decDeg) {
             try {
                 var t = FindTypeAcrossLoadedAssemblies(fullTypeName);
                 if (t == null) return null;
 
-                // Try constructors (best-effort)
                 var ctors = t.GetConstructors(BindingFlags.Public | BindingFlags.Instance);
                 foreach (var c in ctors) {
                     var ps = c.GetParameters();
 
-                    // Common patterns: (double ra, double dec) OR (double ra, double dec, ...)
                     if (ps.Length >= 2 && IsNumeric(ps[0].ParameterType) && IsNumeric(ps[1].ParameterType)) {
-                        // Attempt degrees first, then hours
                         object[] args = new object[ps.Length];
                         args[0] = ConvertNumeric(raDeg, ps[0].ParameterType);
                         args[1] = ConvertNumeric(decDeg, ps[1].ParameterType);
@@ -745,7 +778,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                             if (obj != null) return obj;
                         } catch { }
 
-                        // Try hours
                         args[0] = ConvertNumeric(raHours, ps[0].ParameterType);
                         try {
                             var obj2 = c.Invoke(args);
@@ -754,15 +786,12 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     }
                 }
 
-                // If no constructor worked, create default and set common properties
                 object inst = null;
                 try { inst = Activator.CreateInstance(t); } catch { }
                 if (inst == null) return null;
 
-                // Try set RA/Dec properties (both deg and hours, whichever exists)
                 TrySetNumericProperty(inst, new[] { "RightAscension", "RA", "Ra", "RightAscensionDegrees", "RaDegrees", "RADegrees", "RightAscensionDeg" }, raDeg);
                 TrySetNumericProperty(inst, new[] { "RightAscensionHours", "RaHours" }, raHours);
-
                 TrySetNumericProperty(inst, new[] { "Declination", "DEC", "Dec", "DeclinationDegrees", "DecDegrees" }, decDeg);
 
                 return inst;
@@ -773,11 +802,9 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
         private static Type FindTypeAcrossLoadedAssemblies(string fullName) {
             try {
-                // First try Type.GetType directly
                 var direct = Type.GetType(fullName);
                 if (direct != null) return direct;
 
-                // Search loaded assemblies
                 foreach (var asm in AppDomain.CurrentDomain.GetAssemblies()) {
                     try {
                         var t = asm.GetType(fullName, throwOnError: false, ignoreCase: false);
@@ -823,7 +850,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
         }
 
         private static async Task<bool> TryInvokeKnownSlewNamesAsync(object mediator, double ra, double dec) {
-            // async variants
             object taskObj =
                 InvokeIfExistsLoose(mediator, "SlewToCoordinatesAsync", ra, dec) ??
                 InvokeIfExistsLoose(mediator, "SlewToRaDecAsync", ra, dec) ??
@@ -835,7 +861,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
             if (taskObj is Task t) { await t.ConfigureAwait(false); return true; }
 
-            // sync variants (some return void)
             if (TryInvokeVoidOrAny(mediator, "SlewToCoordinates", ra, dec)) return true;
             if (TryInvokeVoidOrAny(mediator, "SlewToRaDec", ra, dec)) return true;
             if (TryInvokeVoidOrAny(mediator, "SlewToCoordinatesJNow", ra, dec)) return true;
@@ -893,7 +918,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                     var pt = ps[i].ParameterType;
                     if (pt == typeof(bool)) { args[i] = false; continue; }
                     if (pt == typeof(CancellationToken)) { args[i] = CancellationToken.None; continue; }
-                    return null; // unknown extra param
+                    return null;
                 }
 
                 return args;
@@ -964,6 +989,137 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             }
         }
 
+        // ------------------------------
+        // Plate solve value readers (ROBUST)
+        // ------------------------------
+        private static double ReadRaHours(object root) {
+            double raH = ReadDouble(root, new[] { "RightAscensionHours", "RaHours", "RAHours" });
+            if (raH != 0) return raH;
+
+            double raDeg = ReadDouble(root, new[] { "RightAscensionDegrees", "RaDegrees", "RADegrees", "RightAscensionDeg" });
+            if (raDeg != 0) return raDeg / 15.0;
+
+            object raObj = GetAnyProp(root, new[] { "RightAscension", "RA", "Ra" });
+            if (raObj != null) {
+                if (TryConvertToDouble(raObj, out var v)) {
+                    if (Math.Abs(v) > 24.0 + 1e-6) return v / 15.0;
+                    return v;
+                }
+                if (raObj is string s && TryParseSexagesimalToHours(s, out var hh)) return hh;
+            }
+
+            return 0;
+        }
+
+        private static double ReadDecDeg(object root) {
+            double dec = ReadDouble(root, new[] { "Declination", "DEC", "Dec", "DeclinationDegrees", "DecDegrees", "DeclinationDeg" });
+            if (dec != 0) return dec;
+
+            object decObj = GetAnyProp(root, new[] { "Declination", "DEC", "Dec" });
+            if (decObj != null) {
+                if (TryConvertToDouble(decObj, out var v)) return v;
+                if (decObj is string s && TryParseSexagesimalToDegrees(s, out var dd)) return dd;
+            }
+
+            return 0;
+        }
+
+        private static double NormalizeAngleToDegrees(double rot, object resultRoot) {
+            try {
+                if (!double.IsFinite(rot)) return 0;
+
+                double abs = Math.Abs(rot);
+                if (abs > 0 && abs <= (2 * Math.PI + 0.25)) {
+                    return rot * (180.0 / Math.PI);
+                }
+
+                if (abs > 7200) return rot;
+
+                return rot;
+            } catch {
+                return rot;
+            }
+        }
+
+        private static bool TryParseSexagesimalToHours(string s, out double hours) {
+            hours = 0;
+            if (string.IsNullOrWhiteSpace(s)) return false;
+
+            var cleaned = s.Trim()
+                .Replace("h", ":").Replace("m", ":").Replace("s", "")
+                .Replace("°", ":").Replace("'", ":").Replace("\"", "")
+                .Replace(",", ".");
+            cleaned = cleaned.Replace("  ", " ");
+            cleaned = cleaned.Replace(" ", ":");
+
+            var parts = cleaned.Split(new[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return false;
+
+            if (!double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var h)) return false;
+            double m = 0, sec = 0;
+            if (parts.Length > 1) double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out m);
+            if (parts.Length > 2) double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out sec);
+
+            double sign = h < 0 ? -1 : 1;
+            h = Math.Abs(h);
+
+            hours = sign * (h + (m / 60.0) + (sec / 3600.0));
+            return true;
+        }
+
+        private static bool TryParseSexagesimalToDegrees(string s, out double deg) {
+            deg = 0;
+            if (string.IsNullOrWhiteSpace(s)) return false;
+
+            var cleaned = s.Trim()
+                .Replace("d", ":").Replace("°", ":").Replace("'", ":").Replace("\"", "")
+                .Replace(",", ".");
+            cleaned = cleaned.Replace("  ", " ");
+            cleaned = cleaned.Replace(" ", ":");
+
+            var parts = cleaned.Split(new[] { ':' }, StringSplitOptions.RemoveEmptyEntries);
+            if (parts.Length == 0) return false;
+
+            if (!double.TryParse(parts[0], NumberStyles.Float, CultureInfo.InvariantCulture, out var d)) return false;
+            double m = 0, sec = 0;
+            if (parts.Length > 1) double.TryParse(parts[1], NumberStyles.Float, CultureInfo.InvariantCulture, out m);
+            if (parts.Length > 2) double.TryParse(parts[2], NumberStyles.Float, CultureInfo.InvariantCulture, out sec);
+
+            double sign = d < 0 ? -1 : 1;
+            d = Math.Abs(d);
+
+            deg = sign * (d + (m / 60.0) + (sec / 3600.0));
+            return true;
+        }
+
+        private static bool TryConvertToDouble(object v, out double d) {
+            d = 0;
+            if (v == null) return false;
+
+            try {
+                if (v is double dd) { d = dd; return true; }
+                if (v is float ff) { d = ff; return true; }
+                if (v is int ii) { d = ii; return true; }
+                if (v is long ll) { d = ll; return true; }
+                if (v is decimal mm) { d = (double)mm; return true; }
+
+                var t = v.GetType();
+
+                foreach (var pn in new[] { "Degrees", "TotalDegrees", "Hours", "TotalHours", "Value" }) {
+                    var pi = t.GetProperty(pn, BindingFlags.Public | BindingFlags.Instance);
+                    if (pi != null) {
+                        var inner = pi.GetValue(v);
+                        if (inner != null && inner != v && TryConvertToDouble(inner, out d)) return true;
+                    }
+                }
+
+                var s = v.ToString();
+                if (!string.IsNullOrWhiteSpace(s) && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out d)) return true;
+            } catch { }
+
+            return false;
+        }
+
         // ---- Reflection helpers ----
         private static double ReadDouble(object root, string[] names) {
             if (root == null) return 0;
@@ -974,11 +1130,10 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 try {
                     var v = pi.GetValue(root);
                     if (v == null) continue;
-                    if (v is double d) return d;
-                    if (v is float f) return f;
-                    if (v is int i) return i;
-                    if (v is long l) return l;
-                    if (double.TryParse(v.ToString(), out var parsed)) return parsed;
+
+                    if (TryConvertToDouble(v, out var d)) return d;
+
+                    if (v is string s && double.TryParse(s, NumberStyles.Float, CultureInfo.InvariantCulture, out var parsed)) return parsed;
                 } catch { }
             }
             return 0;
@@ -1011,6 +1166,20 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             }
         }
 
+        private static object GetAnyProp(object root, string[] propNames) {
+            if (root == null) return null;
+            try {
+                var t = root.GetType();
+                foreach (var p in propNames) {
+                    var pi = t.GetProperty(p, BindingFlags.Public | BindingFlags.Instance);
+                    if (pi == null) continue;
+                    var v = pi.GetValue(root);
+                    if (v != null) return v;
+                }
+            } catch { }
+            return null;
+        }
+
         private static object InvokeIfExists(object root, string methodName, params object[] args) {
             if (root == null) return null;
             try {
@@ -1025,7 +1194,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             return null;
         }
 
-        // Loose invoke: allow numeric coercion; same arg count
         private static object InvokeIfExistsLoose(object root, string methodName, params object[] args) {
             if (root == null) return null;
             try {
@@ -1052,7 +1220,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             return null;
         }
 
-        // Treat void methods as success too (invoke throws if it fails)
         private static bool TryInvokeVoidOrAny(object root, string methodName, params object[] args) {
             if (root == null) return false;
             try {
@@ -1099,11 +1266,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 try {
                     var v = pi.GetValue(root);
                     if (v == null) continue;
-                    if (v is double d) return d;
-                    if (v is float f) return f;
-                    if (v is int i) return i;
-                    if (v is long l) return l;
-                    if (double.TryParse(v.ToString(), out var parsed)) return parsed;
+                    if (TryConvertToDouble(v, out var d)) return d;
                 } catch { }
             }
             return 0;
@@ -1119,5 +1282,143 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 ei.AddEventHandler(target, del);
             } catch { }
         }
+
+        // =========================================================
+        // NEW: NINA log tailer fallback (no NINA API needed)
+        // =========================================================
+        private readonly struct NinaSolveLine {
+            public NinaSolveLine(double raHours, double decDeg, double paDeg) {
+                RaHours = raHours;
+                DecDeg = decDeg;
+                PositionAngleDeg = paDeg;
+            }
+            public double RaHours { get; }
+            public double DecDeg { get; }
+            public double PositionAngleDeg { get; }
+        }
+
+        private sealed class NinaLogTailer : IDisposable {
+            private readonly CancellationToken _ct;
+            private readonly Action<NinaSolveLine> _onSolve;
+            private readonly object _gate = new object();
+
+            private Task _task;
+            private string _currentFile;
+            private long _pos;
+
+            // Matches example:
+            // "...Platesolve successful: Coordinates: RA: 05:34:12; Dec: -05° 28' 12\"; Epoch: J2000 - Position Angle: 23.5030"
+            private static readonly Regex SolveOk =
+                new Regex(@"Platesolve successful:\s*Coordinates:\s*RA:\s*(?<ra>\d{1,2}:\d{2}:\d{2})\s*;\s*Dec:\s*(?<dec>[-+−]?\d{1,2})\D+(?<dm>\d{1,2})\D+(?<ds>\d{1,2})\D+.*?Position Angle:\s*(?<pa>[-+−]?\d+(\.\d+)?)",
+                          RegexOptions.Compiled | RegexOptions.CultureInvariant | RegexOptions.IgnoreCase);
+
+            public NinaLogTailer(CancellationToken ct, Action<NinaSolveLine> onSolve) {
+                _ct = ct;
+                _onSolve = onSolve;
+            }
+
+            public void Start() {
+                _task = Task.Run(Loop, _ct);
+            }
+
+            private async Task Loop() {
+                while (!_ct.IsCancellationRequested) {
+                    try {
+                        EnsureCurrentLogFile();
+
+                        if (!string.IsNullOrWhiteSpace(_currentFile) && File.Exists(_currentFile)) {
+                            using (var fs = new FileStream(_currentFile, FileMode.Open, FileAccess.Read, FileShare.ReadWrite))
+                            using (var sr = new StreamReader(fs, Encoding.UTF8, detectEncodingFromByteOrderMarks: true, bufferSize: 4096, leaveOpen: true)) {
+                                if (_pos > fs.Length) _pos = 0; // log rotated/truncated
+                                fs.Seek(_pos, SeekOrigin.Begin);
+                                string line;
+                                while ((line = await sr.ReadLineAsync().ConfigureAwait(false)) != null) {
+                                    _pos = fs.Position;
+                                    TryParseSolveLine(line);
+                                }
+                            }
+                        }
+                    } catch {
+                        // ignore; retry
+                    }
+
+                    try { await Task.Delay(350, _ct).ConfigureAwait(false); } catch { }
+                }
+            }
+
+            private void EnsureCurrentLogFile() {
+                // NINA logs typically in: %LOCALAPPDATA%\NINA\Logs\*.log
+                // If that folder doesn't exist, we do nothing.
+                try {
+                    var logsDir = Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.LocalApplicationData), "NINA", "Logs");
+                    if (!Directory.Exists(logsDir)) return;
+
+                    var newest = Directory.EnumerateFiles(logsDir, "*.log", SearchOption.TopDirectoryOnly)
+                        .Select(p => new FileInfo(p))
+                        .OrderByDescending(fi => fi.LastWriteTimeUtc)
+                        .FirstOrDefault();
+
+                    if (newest == null) return;
+
+                    lock (_gate) {
+                        if (!string.Equals(_currentFile, newest.FullName, StringComparison.OrdinalIgnoreCase)) {
+                            _currentFile = newest.FullName;
+                            _pos = 0; // start from beginning (safe); logs are not huge
+                        }
+                    }
+                } catch { }
+            }
+
+            private void TryParseSolveLine(string line) {
+                try {
+                    if (string.IsNullOrWhiteSpace(line)) return;
+                    var m = SolveOk.Match(line);
+                    if (!m.Success) return;
+
+                    var raStr = m.Groups["ra"].Value; // HH:MM:SS
+                    if (!TryParseRaHmsToHours(raStr, out var raHours)) return;
+
+                    int d = ParseInt(m.Groups["dec"].Value);
+                    int dm = ParseInt(m.Groups["dm"].Value);
+                    int ds = ParseInt(m.Groups["ds"].Value);
+                    double sign = d < 0 ? -1.0 : 1.0;
+                    double decDeg = sign * (Math.Abs(d) + (dm / 60.0) + (ds / 3600.0));
+
+                    var paStr = m.Groups["pa"].Value.Replace('−', '-');
+                    if (!double.TryParse(paStr, NumberStyles.Float, CultureInfo.InvariantCulture, out var paDeg)) paDeg = 0;
+
+                    _onSolve?.Invoke(new NinaSolveLine(raHours, decDeg, paDeg));
+                } catch { }
+            }
+
+            private static int ParseInt(string s) {
+                if (string.IsNullOrWhiteSpace(s)) return 0;
+                s = s.Replace('−', '-');
+                int.TryParse(s, NumberStyles.Integer, CultureInfo.InvariantCulture, out var v);
+                return v;
+            }
+
+            private static bool TryParseRaHmsToHours(string hms, out double hours) {
+                hours = 0;
+                if (string.IsNullOrWhiteSpace(hms)) return false;
+                var parts = hms.Split(':');
+                if (parts.Length != 3) return false;
+
+                if (!double.TryParse(parts[0], NumberStyles.Integer, CultureInfo.InvariantCulture, out var h)) return false;
+                if (!double.TryParse(parts[1], NumberStyles.Integer, CultureInfo.InvariantCulture, out var m)) return false;
+                if (!double.TryParse(parts[2], NumberStyles.Integer, CultureInfo.InvariantCulture, out var s)) return false;
+
+                hours = h + (m / 60.0) + (s / 3600.0);
+                // Normalize
+                while (hours < 0) hours += 24;
+                while (hours >= 24) hours -= 24;
+                return true;
+            }
+
+            public void Dispose() {
+                // nothing special; cancellation handled externally
+            }
+        }
+        // =========================================================
     }
 }

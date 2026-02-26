@@ -7,10 +7,8 @@
              xmlns:wv2="clr-namespace:Microsoft.Web.WebView2.Wpf;assembly=Microsoft.Web.WebView2.Wpf"
              Focusable="True">
     <Grid>
-        <!-- Focusable=True is IMPORTANT in docking scenarios -->
         <wv2:WebView2 x:Name="SkyWebView" Focusable="True" />
 
-        <!-- Debug overlay so we always see what's happening -->
         <Border x:Name="DebugBar"
                 VerticalAlignment="Top"
                 Background="#AA000000"

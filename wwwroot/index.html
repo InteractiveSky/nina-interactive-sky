@@ -152,6 +152,24 @@
       opacity:.78;
       line-height:1.35;
     }
+
+    /* ===== Optional: tiny badge showing solved center ===== */
+    #solveBadge {
+      position:absolute;
+      left:16px;
+      bottom:16px;
+      z-index:35;
+      padding:8px 10px;
+      border-radius:12px;
+      background:rgba(0,0,0,.45);
+      border:1px solid rgba(255,255,255,.12);
+      color:#eaeaf2;
+      font-size:12px;
+      font-family: Consolas, ui-monospace, Menlo, monospace;
+      white-space:pre;
+      pointer-events:none;
+      display:none;
+    }
   </style>
 </head>
 
@@ -181,6 +199,8 @@
     <div class="big">Plate-Solve First</div>
     <div class="small">Accurate framing requires a solved image.<br/>Run Plate Solve in NINA, then return here.</div>
   </div>
+
+  <div id="solveBadge">Solve: NO</div>
 
   <div id="error"></div>
 </div>
@@ -213,6 +233,7 @@
   const mountRect= document.getElementById("mountRect");
   const btnSyncSlew = document.getElementById("btnSyncSlew");
   const needSolveEl = document.getElementById("needSolve");
+  const solveBadgeEl = document.getElementById("solveBadge");
 
   let aladinInstance = null;
   let cameraFov = null;
@@ -276,8 +297,6 @@
   }
 
   function updateSolveOverlay(){
-    // High-end behavior:
-    // If no plate solve, show overlay and mute FOV a bit.
     if (!HAS_PLATESOLVE) {
       needSolveEl.style.display = "block";
       fovRect.style.opacity = "0.45";
@@ -285,6 +304,14 @@
       needSolveEl.style.display = "none";
       fovRect.style.opacity = "1.0";
     }
+
+    // show small badge always (helpful debugging)
+    solveBadgeEl.style.display = "block";
+    solveBadgeEl.textContent =
+      `Solve: ${HAS_PLATESOLVE ? "YES" : "NO"}\n` +
+      `Rot: ${ROTATION_DEG.toFixed(1)}°\n` +
+      `RA: ${SOLVE_RA_HOURS.toFixed(4)}h\n` +
+      `Dec:${SOLVE_DEC_DEG.toFixed(3)}°`;
   }
 
   function updateFovOverlay(aladin){
@@ -395,7 +422,6 @@
     const msgSet  = { type: "setTarget", raHours: raHours, decDeg: c.decDeg };
     const msgSlew = { type: "slewToTarget" };
 
-    // send as object
     postToHost(msgSet);
     postToHost(msgSlew);
 
@@ -420,7 +446,12 @@
   // Receive state from NINA host
   if (window.chrome?.webview) {
     window.chrome.webview.addEventListener("message", (ev) => {
-      const msg = ev.data;
+      let msg = ev.data;
+
+      // Some hosts send JSON string instead of object
+      if (typeof msg === "string") {
+        try { msg = JSON.parse(msg); } catch { return; }
+      }
       if (!msg || typeof msg !== "object") return;
 
       if (msg.type === "skyState") {

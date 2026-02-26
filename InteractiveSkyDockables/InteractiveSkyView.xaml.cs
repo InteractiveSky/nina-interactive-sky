@@ -1,4 +1,7 @@
-﻿using Microsoft.Web.WebView2.Core;
+﻿// =========================
+// File: InteractiveSkyView.xaml.cs
+// =========================
+using Microsoft.Web.WebView2.Core;
 using System;
 using System.ComponentModel;
 using System.IO;
@@ -15,7 +18,7 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
 
         private readonly DispatcherTimer _heartbeat;
 
-        // NEW: preserve last important text so heartbeat doesn't overwrite it
+        // preserve last important text so heartbeat doesn't overwrite it
         private string _lastNonHeartbeatDebug = "";
 
         public InteractiveSkyView() {
@@ -30,8 +33,6 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
             };
             _heartbeat.Tick += (_, __) => {
                 TrySendSkyState("Heartbeat");
-                // IMPORTANT: do NOT steal focus every tick (it can break clicks)
-                // ForceWebViewFocus("Heartbeat");
             };
         }
 
@@ -262,7 +263,8 @@ namespace NINA.InteractiveSky.InteractiveSkyDockables {
                 var msg =
                     $"Sent sky ✅ ({reason})  " +
                     $"Mount: {(vm.MountConnected ? "ON" : "OFF")} RA {vm.MountRaHours:0.000}h Dec {vm.MountDecDeg:0.00}°  " +
-                    $"Solve: {(vm.HasPlateSolve ? "YES" : "NO")} Rot {vm.RotationDeg:0.0}°";
+                    $"Solve: {(vm.HasPlateSolve ? "YES" : "NO")} Rot {vm.RotationDeg:0.0}°  " +
+                    $"SolveCenter: RA {vm.SolveRaHours:0.000}h Dec {vm.SolveDecDeg:0.00}°";
 
                 if (!string.Equals(reason, "Heartbeat", StringComparison.OrdinalIgnoreCase)) {
                     _lastNonHeartbeatDebug = msg;
